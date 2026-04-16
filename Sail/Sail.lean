@@ -1,4 +1,5 @@
 import Sail.Attr
+import Sail.BitVecOpt
 
 import Std.Data.ExtDHashMap
 import Std.Data.ExtHashMap
