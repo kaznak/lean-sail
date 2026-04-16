@@ -464,10 +464,59 @@ section Regs
 
 variable {Register : Type} {RegisterType : Register → Type} [DecidableEq Register] [Hashable Register]
 
+/-- Page size for paged memory (4 KB). -/
+def MEM_PAGE_SIZE : Nat := 4096
+/-- Bit shift for page number extraction. -/
+def MEM_PAGE_SHIFT : Nat := 12
+
+/-- Paged memory: maps page number (addr >> 12) to a 4 KB ByteArray.
+    Unmapped pages are treated as not yet allocated.
+    Within a page, bytes default to 0 on first allocation. -/
+structure PagedMem where
+  pages : Std.ExtHashMap Nat ByteArray := default
+
+namespace PagedMem
+
+def empty : PagedMem := ⟨default⟩
+
+def readByte (mem : PagedMem) (addr : Nat) : Option UInt8 :=
+  let pageNum := addr >>> MEM_PAGE_SHIFT
+  let offset := addr &&& (MEM_PAGE_SIZE - 1)
+  match mem.pages.get? pageNum with
+  | some page => some (page.get! offset)
+  | none => none
+
+def writeByte (mem : PagedMem) (addr : Nat) (val : UInt8) : PagedMem :=
+  let pageNum := addr >>> MEM_PAGE_SHIFT
+  let offset := addr &&& (MEM_PAGE_SIZE - 1)
+  let page := match mem.pages.get? pageNum with
+    | some page => page
+    | none => ByteArray.mk (.replicate MEM_PAGE_SIZE 0)
+  let page := page.set! offset val
+  ⟨mem.pages.insert pageNum page⟩
+
+/-- Read `size` bytes starting at `addr` into a Nat (little-endian).
+    Returns none if any byte is in an unmapped page. -/
+def readNat (mem : PagedMem) (addr : Nat) (size : Nat) : Option Nat :=
+  go mem addr size 0 0
+where
+  go (mem : PagedMem) (addr : Nat) (remaining : Nat) (shift : Nat) (acc : Nat) : Option Nat :=
+    match remaining with
+    | 0 => some acc
+    | n + 1 =>
+      match mem.readByte addr with
+      | some b => go mem (addr + 1) n (shift + 8) (acc ||| (b.toNat <<< shift))
+      | none => none
+
+end PagedMem
+
+instance : Inhabited PagedMem where
+  default := PagedMem.empty
+
 structure SequentialState (RegisterType : Register → Type) (c : ChoiceSource) where
   regs : Std.ExtDHashMap Register RegisterType
   choiceState : c.α
-  mem : Std.ExtHashMap Nat (BitVec 8)
+  mem : PagedMem
   tags : Unit
   cycleCount : Nat -- Part of the concurrency interface. See `{get_}cycle_count`
   sailOutput : Array String -- TODO: be able to use the IO monad to run
@@ -557,7 +606,7 @@ section ConcurrencyInterface
 
 @[simp_sail]
 def writeByte (addr : Nat) (value : BitVec 8) : PreSailM RegisterType c ue PUnit := do
-  modify fun s => { s with mem := s.mem.insert addr value }
+  modify fun s => { s with mem := s.mem.writeByte addr value.toNat.toUInt8 }
 
 @[simp_sail]
 def writeBytes (addr : Nat) (value : BitVec (8 * n)) : PreSailM RegisterType c ue Bool := do
@@ -579,23 +628,17 @@ def write_ram (addr_size data_size : Nat) (_hex_ram addr : BitVec addr_size) (va
 
 @[simp_sail]
 def readByte (addr : Nat) : PreSailM RegisterType c ue (BitVec 8) := do
-  let .some s := (← get).mem.get? addr
+  let .some b := (← get).mem.readByte addr
     | throw (.OutOfMemoryRange addr)
-  pure s
+  pure (BitVec.ofNat 8 b.toNat)
 
 @[simp_sail]
-def readBytes (size : Nat) (addr : Nat) : PreSailM RegisterType c ue ((BitVec (8 * size)) × Option Bool) :=
-  match size with
-  | 0 => pure (default, none)
-  | 1 => do
-    let b ← readByte addr
-    have h : 8 * 1 = 8 := rfl
-    return (h ▸ b, none)
-  | n + 1 => do
-    let b ← readByte addr
-    let (bytes, bool) ← readBytes n (addr+1)
-    have h : 8 * n + 8 = 8 * (n + 1) := by omega
-    return (h ▸ bytes.append b, bool)
+def readBytes (size : Nat) (addr : Nat) : PreSailM RegisterType c ue ((BitVec (8 * size)) × Option Bool) := do
+  if size = 0 then pure (default, none)
+  else
+    let .some n := (← get).mem.readNat addr size
+      | throw (.OutOfMemoryRange addr)
+    pure (BitVec.ofNat (8 * size) n, none)
 
 @[simp_sail]
 def readBytesVec (size : Nat) (addr : Nat) :
