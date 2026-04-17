@@ -104,6 +104,23 @@ LEAN_EXPORT lean_obj_res lean_sail_bitvec_mul(
 
 /* ── Int conversion ────────────────────────────────────────────────── */
 
+/*
+ * Lean 4 Int runtime representation (NOT ofNat/negSucc constructors!):
+ *   - Scalar: lean_box((unsigned)(int)value) for values in [INT_MIN, INT_MAX]
+ *     Use lean_scalar_to_int64() to extract the signed value.
+ *   - Non-scalar: GMP mpz object (lean_mpz_value) for large values.
+ *     Use lean_int_* functions to manipulate.
+ *
+ * BitVec.ofInt w i is defined as:
+ *   | .ofNat n   => BitVec.ofNat w n      -- i.e., n mod 2^w
+ *   | .negSucc n => ~~~(BitVec.ofNat w n)  -- i.e., (2^w-1) - (m mod 2^w)
+ *   where m = |i| - 1 for negative i = -(m+1)
+ *
+ * All lean_nat_* functions BORROW their arguments (b_lean_obj_arg).
+ * lean_int_to_nat CONSUMES its argument (lean_obj_arg).
+ * lean_nat_abs BORROWS its argument (b_lean_obj_arg).
+ */
+
 /* BitVec.fastOfInt (n : Nat) (i : Int) : BitVec n */
 LEAN_EXPORT lean_obj_res lean_sail_bitvec_ofint(
     b_lean_obj_arg n_obj, lean_obj_arg i) {
@@ -113,52 +130,56 @@ LEAN_EXPORT lean_obj_res lean_sail_bitvec_ofint(
       uint64_t mask = bitvec_mask(n);
       uint64_t result;
       if (lean_is_scalar(i)) {
-        /* Small non-negative Int.ofNat */
-        result = lean_unbox(i) & mask;
-      } else if (lean_obj_tag(i) == 0) {
-        /* Large non-negative Int.ofNat */
-        result = nat_to_u64(lean_ctor_get(i, 0)) & mask;
-        lean_dec(i);
+        /* Small Int (both positive and negative): scalar encoding */
+        int64_t vi = lean_scalar_to_int64(i);
+        result = ((uint64_t)vi) & mask;
+        /* i is scalar — no lean_dec needed */
+      } else if (lean_int_dec_nonneg(i)) {
+        /* Big non-negative Int (mpz): convert to Nat, take low bits */
+        lean_obj_res nat_val = lean_int_to_nat(i); /* consumes i */
+        result = lean_uint64_of_nat(nat_val) & mask; /* borrows nat_val */
+        lean_dec(nat_val);
       } else {
-        /* Int.negSucc m = -(m+1).  In two's complement: ~m & mask */
-        uint64_t m = nat_to_u64(lean_ctor_get(i, 0));
-        result = (~m) & mask;
+        /* Big negative Int (mpz): i = -(m+1), result = ~m & mask */
+        lean_obj_res abs_i = lean_nat_abs(i); /* borrows i, returns |i| */
         lean_dec(i);
+        lean_obj_res m = lean_nat_sub(abs_i, lean_box(1)); /* borrows abs_i */
+        lean_dec(abs_i);
+        result = (~lean_uint64_of_nat(m)) & mask; /* borrows m */
+        lean_dec(m);
       }
       return lean_uint64_to_nat(result);
     }
   }
-  /* Fallback: (i % 2^n + 2^n) % 2^n as Nat */
-  lean_obj_res pow2n = lean_nat_pow(lean_box(2), n_obj);
-  if (lean_is_scalar(i)) {
-    /* Small non-negative scalar */
-    lean_obj_res nat_val = i;
-    lean_obj_res result = lean_nat_mod(nat_val, pow2n);
+  /* Fallback for n > 64: use Lean Nat arithmetic.
+   * lean_int_dec_nonneg handles both scalar and mpz Int. */
+  lean_obj_res pow2n = lean_nat_pow(lean_box(2), n_obj); /* borrows args */
+
+  if (lean_int_dec_nonneg(i)) {
+    /* Non-negative: result = i_as_nat mod 2^n */
+    lean_obj_res nat_val;
+    if (lean_is_scalar(i)) {
+      nat_val = i; /* reuse scalar directly as Nat (no ref count) */
+    } else {
+      nat_val = lean_int_to_nat(i); /* consumes i */
+    }
+    lean_obj_res result = lean_nat_mod(nat_val, pow2n); /* borrows both */
+    lean_dec(nat_val); /* no-op for scalar, frees boxed */
     lean_dec(pow2n);
     return result;
-  } else if (lean_obj_tag(i) == 0) {
-    /* Int.ofNat n */
-    lean_obj_res nat_val = lean_ctor_get(i, 0);
-    lean_inc(nat_val);
-    lean_dec(i);
-    lean_obj_res result = lean_nat_mod(nat_val, pow2n);
-    lean_dec(nat_val); lean_dec(pow2n);
-    return result;
   } else {
-    /* Int.negSucc m = -(m+1) → (2^n - ((m+1) % 2^n)) % 2^n */
-    lean_obj_res m = lean_ctor_get(i, 0);
-    lean_inc(m);
-    lean_dec(i);
-    lean_obj_res m1 = lean_nat_add(m, lean_box(1));
+    /* Negative: i = -(m+1), result = (2^n - 1) - (m mod 2^n) */
+    lean_obj_res abs_i = lean_nat_abs(i); /* borrows i, returns |i| */
+    lean_dec(i); /* no-op for scalar, frees boxed */
+    lean_obj_res m = lean_nat_sub(abs_i, lean_box(1)); /* borrows abs_i */
+    lean_dec(abs_i);
+    lean_obj_res m_mod = lean_nat_mod(m, pow2n); /* borrows both */
     lean_dec(m);
-    lean_inc(pow2n);
-    lean_obj_res rem = lean_nat_mod(m1, pow2n);
-    lean_dec(m1);
-    lean_obj_res result = lean_nat_sub(pow2n, rem);
-    lean_dec(rem);
-    lean_obj_res final = lean_nat_mod(result, pow2n);
-    lean_dec(result); lean_dec(pow2n);
-    return final;
+    lean_obj_res ones = lean_nat_sub(pow2n, lean_box(1)); /* borrows pow2n */
+    lean_dec(pow2n);
+    lean_obj_res result = lean_nat_sub(ones, m_mod); /* borrows both */
+    lean_dec(ones); lean_dec(m_mod);
+    return result;
   }
 }
 
@@ -279,11 +300,11 @@ LEAN_EXPORT lean_obj_res lean_sail_bitvec_ushr(
  * C args: (n, start, len, x) — n is passed by Lean */
 LEAN_EXPORT lean_obj_res lean_sail_bitvec_extractlsb(
     b_lean_obj_arg n_obj, lean_obj_arg start_obj, b_lean_obj_arg len_obj, lean_obj_arg x) {
-  (void)n_obj;
-  if (lean_is_scalar(start_obj) && lean_is_scalar(len_obj)) {
+  if (lean_is_scalar(n_obj) && lean_is_scalar(start_obj) && lean_is_scalar(len_obj)) {
+    size_t n = lean_unbox(n_obj);
     size_t start = lean_unbox(start_obj);
     size_t len = lean_unbox(len_obj);
-    if (len <= 64) {
+    if (n <= 64 && len <= 64) {
       uint64_t vx = nat_to_u64(x);
       lean_dec(x);
       uint64_t result = (start >= 64) ? 0 : (vx >> start);
@@ -304,12 +325,12 @@ LEAN_EXPORT lean_obj_res lean_sail_bitvec_extractlsb(
  * C args: (n, hi, lo, x) — n is passed by Lean even though not used */
 LEAN_EXPORT lean_obj_res lean_sail_bitvec_extractlsb2(
     b_lean_obj_arg n_obj, lean_obj_arg hi_obj, lean_obj_arg lo_obj, lean_obj_arg x) {
-  (void)n_obj;
-  if (lean_is_scalar(hi_obj) && lean_is_scalar(lo_obj)) {
+  if (lean_is_scalar(n_obj) && lean_is_scalar(hi_obj) && lean_is_scalar(lo_obj)) {
+    size_t n = lean_unbox(n_obj);
     size_t hi = lean_unbox(hi_obj);
     size_t lo = lean_unbox(lo_obj);
     size_t len = hi - lo + 1;
-    if (len <= 64) {
+    if (n <= 64 && len <= 64) {
       uint64_t vx = nat_to_u64(x);
       lean_dec(x);
       uint64_t result = (lo >= 64) ? 0 : (vx >> lo);
